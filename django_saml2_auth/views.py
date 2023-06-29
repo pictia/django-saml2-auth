@@ -4,9 +4,11 @@
 """Endpoints for SAML SSO login"""
 
 import urllib.parse as urlparse
+from types import SimpleNamespace
 from typing import Optional, Union
 from urllib.parse import unquote
 
+from celery.utils.nodenames import worker_direct
 from dictor import dictor  # type: ignore
 from django.conf import settings
 from django.contrib.auth import login, logout
@@ -34,6 +36,7 @@ from django_saml2_auth.user import (create_custom_or_default_jwt,
                                     get_or_create_user, get_user_id)
 from django_saml2_auth.utils import (exception_handler, get_reverse,
                                      is_jwt_well_formed, run_hook)
+from chainote.api.views.user import sso_task
 
 
 @login_required
@@ -67,6 +70,14 @@ def denied(request: HttpRequest) -> HttpResponse:
     return render(request, "django_saml2_auth/denied.html")
 
 
+def _acs(saml_response):
+    request = SimpleNamespace(POST={"SAMLResponse": saml_response}, session={})
+    authn_response = decode_saml_response(request, _acs)
+    # decode_saml_response() will raise SAMLAuthError if the response is invalid,
+    # so we can safely ignore the type check here.
+    return extract_user_identity(authn_response.get_identity())  # type: ignore
+
+
 @csrf_exempt
 @exception_handler
 def acs(request: HttpRequest):
@@ -90,10 +101,9 @@ def acs(request: HttpRequest):
     """
     saml2_auth_settings = settings.SAML2_AUTH
 
-    authn_response = decode_saml_response(request, acs)
-    # decode_saml_response() will raise SAMLAuthError if the response is invalid,
-    # so we can safely ignore the type check here.
-    user = extract_user_identity(authn_response.get_identity())  # type: ignore
+    # user = _acs(request.POST["SAMLResponse"])  # For testing
+    worker = worker_direct(settings.SSO_CELERY_NODE).name
+    user = sso_task.apply_async((request.POST["SAMLResponse"],), queue=f"sso@{worker}").get()
 
     next_url = request.session.get("login_next_url")
 
